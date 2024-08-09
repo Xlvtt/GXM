@@ -13,6 +13,8 @@ sns.set_style('whitegrid')
 plt.rcParams.update({'font.size': 15})
 
 
+# TODO USE TENSORBOARD
+# TODO USE DEVICE
 def plot_losses(train_losses: List[float], val_losses: List[float]):
     """
     Plot loss and perplexity of train and validation samples
@@ -25,11 +27,8 @@ def plot_losses(train_losses: List[float], val_losses: List[float]):
     axs[0].plot(range(1, len(val_losses) + 1), val_losses, label='val')
     axs[0].set_ylabel('loss')
 
-    """
-    YOUR CODE HERE (⊃｡•́‿•̀｡)⊃━✿✿✿✿✿✿
-    Calculate train and validation perplexities given lists of losses
-    """
-    train_perplexities, val_perplexities = [], []
+    train_perplexities = torch.exp(torch.tensor(train_losses, dtype=torch.float64))
+    val_perplexities = torch.exp(torch.tensor(val_losses, dtype=torch.float64))
 
     axs[1].plot(range(1, len(train_perplexities) + 1), train_perplexities, label='train')
     axs[1].plot(range(1, len(val_perplexities) + 1), val_perplexities, label='val')
@@ -40,7 +39,6 @@ def plot_losses(train_losses: List[float], val_losses: List[float]):
         ax.legend()
 
     plt.show()
-
 
 def training_epoch(model: LanguageModel, optimizer: torch.optim.Optimizer, criterion: nn.Module,
                    loader: DataLoader, tqdm_desc: str):
@@ -58,14 +56,18 @@ def training_epoch(model: LanguageModel, optimizer: torch.optim.Optimizer, crite
 
     model.train()
     for indices, lengths in tqdm(loader, desc=tqdm_desc):
-        """
-        YOUR CODE HERE (⊃｡•́‿•̀｡)⊃━✿✿✿✿✿✿
-        Process one training step: calculate loss,
-        call backward and make one optimizer step.
-        Accumulate sum of losses for different batches in train_loss
-        """
+        optimizer.zero_grad()
+        logits = model(indices, lengths)[:, :-1, :]  # Batch x (MaxLen-1) x VocabSize, не берем bos
+        logits = torch.transpose(logits, 1, 2)  # Batch x VocabSize x (MaxLen-1) - такова воля CrossEntropyLoss
 
-    train_loss /= len(loader.dataset)
+        y_true = indices[:, 1:logits.shape[2]+1]  # Batch x Len-1, тут отрезаем eos
+        loss = criterion(logits, y_true)  # Получаем желаемое соответствие
+        loss.backward()
+        optimizer.step()
+
+        train_loss += loss.item()  # лосс на батче
+
+    train_loss /= len(loader)  # Усредняем лосс по числу батчей
     return train_loss
 
 
@@ -85,18 +87,21 @@ def validation_epoch(model: LanguageModel, criterion: nn.Module,
 
     model.eval()
     for indices, lengths in tqdm(loader, desc=tqdm_desc):
-        """
-        YOUR CODE HERE (⊃｡•́‿•̀｡)⊃━✿✿✿✿✿✿
-        Process one validation step: calculate loss.
-        Accumulate sum of losses for different batches in val_loss
-        """
+        logits = model(indices, lengths)[:, :-1, :]  # Batch x Len x VocabSize
+        logits = torch.transpose(logits, 1, 2)  # Batch x VocabSize x (MaxLen-1) - такова воля CrossEntropyLoss
 
-    val_loss /= len(loader.dataset)
+        y_true = indices[:, 1:logits.shape[2]+1]
+        loss = criterion(logits, y_true)
+
+        val_loss += loss.item()
+
+    val_loss /= len(loader)
     return val_loss
 
 
 def train(model: LanguageModel, optimizer: torch.optim.Optimizer, scheduler: Optional[Any],
-          train_loader: DataLoader, val_loader: DataLoader, num_epochs: int, num_examples=5):
+          train_loader: DataLoader, val_loader: DataLoader, num_epochs: int,
+          saving_path: Optional[str] = None, num_examples: int = 5):
     """
     Train language model for several epochs
     :param model: language model to train
@@ -106,6 +111,7 @@ def train(model: LanguageModel, optimizer: torch.optim.Optimizer, scheduler: Opt
     :param val_loader: validation dataloader
     :param num_epochs: number of training epochs
     :param num_examples: number of generation examples to print after each epoch
+    :param saving_path
     """
     train_losses, val_losses = [], []
     criterion = nn.CrossEntropyLoss(ignore_index=train_loader.dataset.pad_id)
@@ -127,6 +133,26 @@ def train(model: LanguageModel, optimizer: torch.optim.Optimizer, scheduler: Opt
         val_losses += [val_loss]
         plot_losses(train_losses, val_losses)
 
-        print('Generation examples:')
-        for _ in range(num_examples):
-            print(model.inference())
+        if saving_path is not None:
+            state_dict = {
+                "epoсh": epoch,  # Последняя завершенная эпоха
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'train_losses': torch.tensor(train_losses),
+                'val_losses': torch.tensor(val_losses),
+                'embed_size': torch.tensor(model.embedding.embedding_dim, dtype=torch.int64),
+                'hidden_size': torch.tensor(model.rnn.hidden_size, dtype=torch.int64),
+                'rnn_layers': torch.tensor(model.rnn.num_layers, dtype=torch.int64),
+                'dropout': torch.tensor(model.rnn.dropout)
+            }
+            if scheduler is not None:
+                state_dict['scheduler'] = scheduler.state_dict()
+            torch.save(state_dict, saving_path)
+
+        generate_examples(model, num_examples)
+
+
+def generate_examples(model: torch.nn.Module, num_examples: int = 5):
+    print('Generation examples:')
+    for i in range(num_examples):
+        print(f"{i + 1}.", model.inference())
