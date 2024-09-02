@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import math
-from typing import List, Union, Tuple
+from copy import deepcopy
+from typing import List, Union, Tuple, Dict
 
 from collections import defaultdict
 
@@ -198,7 +199,7 @@ class MyDecisionTree:
             case "mse":
                 cum_sum = np.cumsum(y)[:-1]
                 quadratic_cum_sum = np.cumsum(y ** 2)[:-1]
-                cum_means = cum_sum / lens
+                cum_means = cum_sum / lens  # Лучшие предсказания
                 losses = quadratic_cum_sum - 2 * cum_means * cum_sum + lens * (cum_means ** 2)
                 return losses / lens
             case _:
@@ -226,9 +227,29 @@ class MyDecisionTree:
                 raise ValueError("wrong loss type")
 
 
+def plot_losses(train_metrics: Dict[str, List[float]], val_metrics: Dict[str, List[float]]):
+    clear_output()
+    fig, axs = plt.subplots(1, len(train_metrics))
+    fig.set_figheight(5)
+    fig.set_figwidth((5 + 1) * len(train_metrics))
+
+    for i, metric_name in enumerate(train_metrics):
+        current_axs = axs if len(train_metrics) == 1 else axs[i]
+
+        current_axs.plot(train_metrics[metric_name], label="train")
+        current_axs.plot(val_metrics[metric_name], label="valid")
+        current_axs.set_title(metric_name)
+        current_axs.set_xlabel("iteration")
+        current_axs.set_ylabel("metric")
+        current_axs.legend()
+    plt.show()
+
+
 class RandomForest:
     def __init__(self, n_estimators: int, base_model_params: Union[dict, None] = None,
-                 features_count_rate: float = 0.33,  base_model_class=MyDecisionTree):
+                 features_count_rate: float = 0.33,  base_model_class=MyDecisionTree, plot: bool = False):
+        self.plot = plot
+
         self.n_estimators = n_estimators
         self.features_count_rate = features_count_rate
 
@@ -244,6 +265,9 @@ class RandomForest:
             bootstrap_index = np.random.choice(np.arange(0, len(X)), size=len(X))
             model.fit(X[bootstrap_index], y[bootstrap_index])  # TODO random features for every split
             self.models.append(model)
+
+            if self.plot:
+                pass  # TODO plot
         return self
 
     def predict(self, X: np.ndarray) -> Union[np.ndarray, float]:  # Умеет выдавать ответ для одного объекта
@@ -260,11 +284,51 @@ class RandomForest:
                 raise ValueError("wrong loss type")
 
 
-class GradientBoosting:
-    def __init__(self, loss_type: str, n_estimators: int = 50, learning_rate: float = 0.1, base_model_params: Union[dict, None] = None,
-                 subsample: float = 1.0, plot: bool = False, base_model_class = MyDecisionTree):
+class BoostingBaseTree(MyDecisionTree):  # TODO stops if decreasing loss
+    def __init__(self, boosting_loss: str, loss: str = "mse", max_depth: int = None, feature_types: Union[List[str], None] = None,
+                 min_samples_leaf: int = 1, min_samples_split: int = 2, features_count_rate: Union[float, None] = None,
+                 l2_leaf_reg: int = 1, answer_retrain: bool = False):
+        """
 
-        if loss_type not in ["logloss", "mse"]:
+        :param boosting_loss: лосс бустинга
+        :param loss: лосс базовой модели
+        :param answer_retrain: подбирать ли ответы по лоссу бустинга
+        """
+        super().__init__(loss, max_depth, feature_types, min_samples_leaf, min_samples_split, features_count_rate)
+
+        assert l2_leaf_reg >= 1, "l2_leaf_reg must be >= 1"  # эквивалентно MSE при 1
+        self.l2_leaf_reg = l2_leaf_reg
+
+        self.answer_retrain = answer_retrain
+        self.boosting_loss_type = boosting_loss
+
+    def __get_all_splits_losses(self, y: np.ndarray, lens: np.ndarray) -> np.ndarray:
+        match self.loss_type:
+            case "mse":
+                cum_sum = np.cumsum(y)[:-1]
+                losses = cum_sum ** 2 / self.l2_leaf_reg  # Именно что сумма квадратов
+                return losses / lens
+            case _:
+                raise ValueError("wrong loss type")
+
+    def __answer(self, y: np.ndarray) -> float:
+        match self.loss_type: # self.boosting_loss_type if self.answer_retrain else self.loss_type:
+            case "mse":
+                return y.mean() / (2 * self.l2_leaf_reg)
+            # case "logloss":
+            #     pass  # TODO
+            case _:
+                raise ValueError("wrong loss type")
+
+
+class GradientBoosting:
+    supported_metrics = ["logloss", "mse", "auc"]
+    supported_losses = ["logloss", "mse"]
+
+    def __init__(self, loss_type: str, n_estimators: int = 50, learning_rate: float = 0.1, base_model_params: Union[dict, None] = None,
+                 subsample: float = 1.0, plot: bool = False, base_model_class = BoostingBaseTree):
+
+        if loss_type not in GradientBoosting.supported_losses:
             raise ValueError(f"wrong loss type")
         self.loss_type = loss_type
 
@@ -282,15 +346,19 @@ class GradientBoosting:
         self.base_model_params = base_model_params if base_model_params is not None else {}
         self.models = []
 
-        self.valid_loss_history = []
-        self.train_loss_history = []
-
     def fit(self, X_train: np.ndarray, y_train: np.ndarray,
-            X_valid: Union[np.ndarray, None] = None, y_valid: Union[np.ndarray, None] = None) -> GradientBoosting:
-        if self.loss_type == "lodloss":
+            X_valid: Union[np.ndarray, None] = None, y_valid: Union[np.ndarray, None] = None,
+            eval_metrics: Union[List[str], None] = None) -> GradientBoosting:
+
+        if self.loss_type == "logloss":  # checks
             GradientBoosting.__check_classes(y_train)
 
-        first_model = self.base_model_class(**self.base_model_params)  # tree of depth 1
+        train_metrics = {self.loss_type: []}
+        if eval_metrics is not None:
+            train_metrics.update({metric_name: [] for metric_name in eval_metrics})
+        valid_metrics = deepcopy(train_metrics)
+
+        first_model = self.base_model_class(boosting_loss=self.loss_type, **self.base_model_params)  # tree of depth 1
         first_model.max_depth = 1
         self.models.append(first_model.fit(X_train, y_train))
 
@@ -304,16 +372,19 @@ class GradientBoosting:
             self.models.append(model)
 
             train_preds += self.learning_rate * model.predict(X_train)
-            self.train_loss_history.append(self.__calc_metric(train_preds, y_train))
+            for metric_name in train_metrics:
+                train_metrics[metric_name].append(self.__calc_metric(train_preds, y_train, metric_name))
 
             if X_valid is not None and y_valid is not None:
                 val_preds += self.learning_rate * model.predict(X_valid)
-                self.valid_loss_history.append(self.__calc_metric(val_preds, y_valid))
+                for metric_name in valid_metrics:
+                    valid_metrics[metric_name].append(self.__calc_metric(val_preds, y_valid, metric_name))
+
             if self.plot:
-                self.__plot(self.train_loss_history, self.valid_loss_history)
+                plot_losses(train_metrics, valid_metrics)
 
     def __fit_base_model(self,  X_train: np.ndarray, y: np.ndarray, train_preds: np.ndarray):
-        model = self.base_model_class(**self.base_model_params)
+        model = self.base_model_class(boosting_loss=self.loss_type, **self.base_model_params)
         model.loss_type = "mse"
         base_model_y = self.__loss_anti_gradient(y, train_preds)
         return model.fit(X_train, base_model_y)
@@ -321,7 +392,8 @@ class GradientBoosting:
     def __loss_anti_gradient(self, y: np.ndarray, preds: np.ndarray) -> np.ndarray:  # свои производные на всех объектах
         match self.loss_type:
             case "logloss":
-                # logloss = - ( yi * log(p(xi)) + (1 - yi) log(1 - p(xi)) )
+                #
+                # logloss = - ( yi * log(p(xi)) + (1 - yi) log(1 - p(xi)) ), p(xi) = sigma(a(xi))
                 # - (p`(xi) * yi/ p(xi)  - p`(xi) * (1-yi) / (1 - p(xi)) )
                 # - (yi * (1 - a(xi)) - (1 - yi) * a(xi))
                 # gradient = - yi * (1 - a(xi)) + (1 - yi) * a(xi)
@@ -333,18 +405,21 @@ class GradientBoosting:
                 raise ValueError(f"wrong loss type")
 
     def eval(self, X: np.ndarray, y: np.ndarray) -> float:
-        return self.__calc_metric(self.predict(X), y)
+        return GradientBoosting.__calc_metric(self.predict(X), y, self.loss_type)
 
-    def __calc_metric(self, preds: np.ndarray, y: np.ndarray) -> float:
-        match self.loss_type:
+    @staticmethod
+    def __calc_metric(preds: np.ndarray, y: np.ndarray, metric: str) -> float:
+        match metric:
             case "logloss":
                 # logloss = - 1/N * sum ( yi * log(a(xi)) + (1 - yi) log(1 - a(xi)) )
                 preds = 1 / (1 + np.exp(-preds))
                 return - np.mean(y * np.log(preds) + (1 - y) * np.log(1 - preds))
             case "mse":
                 return np.mean((preds - y) ** 2)
+            case "auc":
+                return roc_auc_score(y, preds)
             case _:
-                raise ValueError(f"wrong loss type")
+                raise ValueError(f"wrong metric type: {metric}")
 
     def predict(self, X: np.ndarray) -> Union[np.ndarray, float]:  # Умеет выдавать ответ для одного объекта
         assert len(self.models) > 0, "model is not fitted"
@@ -356,18 +431,9 @@ class GradientBoosting:
     def predict_proba(self, X: np.ndarray) -> Union[np.ndarray, float]:
         if self.loss_type == "logloss":
             pos_class_probs = 1 / (1 + np.exp(-self.predict(X)))
-            return np.stack((pos_class_probs, 1 - pos_class_probs), axis=-1)
+            return np.stack((1 - pos_class_probs, pos_class_probs), axis=-1)
         else:
             raise ValueError(f"No predict proba for loss{self.loss_type}")
-
-    def __plot(self, train_metrics: List[float], val_metrics: List[float]):
-        clear_output()
-        plt.plot(train_metrics, label="train")
-        plt.plot(val_metrics, label="va")
-        plt.xlabel("iteration")
-        plt.ylabel(self.loss_type)
-        plt.legend()
-        plt.show()
 
     @staticmethod
     def __check_classes(y: np.ndarray):
@@ -376,11 +442,48 @@ class GradientBoosting:
         assert (classes[0] == 1 and classes[1] == 0) \
                or (classes[0] == 0 and classes[1] == 1), "classes must be 0 and 1"
 
-# TODO удобные перепрогнозы
-# TODO lf_leaf_reg (через перепрогнозы или без)
+# Не обязательно использовать MSE для обучения дерева (MSE был выведен для самого обычного бустинга)
+# TODO удобные перепрогнозы - это просто сразу другие овтеты в листьях?
 # TODO GB второго порядка
+# TODO feature importances
+# Для всего этого нужен наслденик
+
 # TODO стоппить дерево, если отриц. impurity
 # TODO catboost feature encoding
+# TODO calc feature importances by impurity
+
+
+if __name__ == "__main__":
+    pass
+    from warnings import filterwarnings
+
+    import matplotlib.pyplot as plt
+    import numpy as np
+    import seaborn as sns
+
+    from scipy.sparse import load_npz
+    from sklearn.model_selection import train_test_split
+    from sklearn.metrics import mean_squared_error, roc_auc_score
+    from sklearn.ensemble import RandomForestRegressor
+    from sklearn import datasets
+
+    from boosting import MyDecisionTree, DecisionTreeRegressor, RandomForest, GradientBoosting
+
+    sns.set(style='darkgrid')
+    filterwarnings('ignore')
+
+    x = load_npz('x.npz').toarray()
+    y = np.load('y.npy')
+    y[y == -1] = 0
+
+    x_train, x_test, y_train, y_test = train_test_split(x, y, test_size=0.2, random_state=1337)
+    x_test, x_valid, y_test, y_valid = train_test_split(x_test, y_test, test_size=0.5, random_state=1337)
+
+    boosting = GradientBoosting(loss_type="logloss", learning_rate=2, n_estimators=30, subsample=0.3, base_model_params={"max_depth": 3, "l2_leaf_reg": 8}, plot=True, base_model_class=BoostingBaseTree)
+    boosting.fit(x_train, y_train, x_valid, y_valid, eval_metrics=["auc"])
+
+
+
 
 # class Boosting:
 #
